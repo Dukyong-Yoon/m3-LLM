@@ -1,12 +1,17 @@
 """
 M3 MCP Server - MIMIC-IV + MCP + Models
-Provides MCP tools for querying MIMIC-IV data via DuckDB (local) or BigQuery.
+Provides MCP tools for querying MIMIC-IV data via SQLite or BigQuery.
 """
 
 import os
+import sqlite3
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
+import time
+import requests
+import re  
 
-import duckdb
+import pandas as pd
 import sqlparse
 from fastmcp import FastMCP
 
@@ -22,10 +27,96 @@ _db_path = None
 _bq_client = None
 _project_id = None
 
+# ==========================================
+# PREFLIGHT HELPERS FOR FEEDING-TUBE TASK
+# ==========================================
+
+_FEWSHOT_LINE_RE = re.compile(
+    r'-\s*note:\s*"(.*?)"\s*;\s*label:\s*"(Yes|No|Unclear)"',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_ftube_fewshots(raw: str) -> List[Tuple[str, str]]:
+    """Simply parse few-shot example patterns from user text."""
+    pairs: List[Tuple[str, str]] = []
+    for m in _FEWSHOT_LINE_RE.finditer(raw):
+        note = m.group(1).strip()
+        label = m.group(2).title().strip()
+        if note and label:
+            pairs.append((note, label))
+    return pairs
+
+
+def _extract_ftube_context_and_where(user_text: str) -> Tuple[str, str]:
+    """
+    Extract Context: ... / WHERE: ... blocks from user input if present.
+    - Treat the line after prefixes like Context:, 배경:, 정의: as the context
+    - Treat the line after prefixes like WHERE:, 조건: as the where_clause hint
+    """
+    ctx = ""
+    where = ""
+
+    # Context / background / definition section
+    m_ctx = re.search(
+        r"(?:Context|context|Background|background|Definition|definition)\s*:\s*(.+)",
+        user_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m_ctx:
+        ctx = m_ctx.group(1).strip()
+
+    # WHERE / condition section
+    m_where = re.search(
+        r"(?:WHERE|where|Condition|condition)\s*:\s*(.+)",
+        user_text,
+        re.IGNORECASE,
+    )
+    if m_where:
+        where = m_where.group(1).strip()
+
+    return ctx, where
+
 
 def _validate_limit(limit: int) -> bool:
     """Validate limit parameter to prevent resource exhaustion."""
     return isinstance(limit, int) and 0 < limit <= 1000
+
+def _contains_raw_note_text(sql_query: str) -> bool:
+    """
+    Detect direct accesses to note text columns to prevent PHI exposure
+    within execute_mimic_query.
+
+    Examples of blocked patterns:
+      - ' text', 'note_text', '.text'
+      - lower(text), substr(text,...)
+      - LIKE '%ng tube%', etc.
+    """
+    q = sql_query.lower()
+
+    # Reading raw text from note tables
+    if " from note_" in q or "from note " in q:
+        if " text" in q or "note_text" in q or ".text" in q:
+            return True
+        if "substr(text" in q or "lower(text" in q:
+            return True
+
+    text_patterns = [
+        " text ",          # SELECT text, ...
+        " text,",          # SELECT text, ...
+        ".text",           # t.text
+        "substr(text", 
+        "lower(text",
+        " like '%ng tube%'", 
+        " like '%peg%'", 
+        " like '%tube feed%'", 
+        " like '%enteral%'", 
+    ]
+    for pat in text_patterns:
+        if pat in q:
+            return True
+
+    return False
 
 
 def _is_safe_query(sql_query: str, internal_tool: bool = False) -> tuple[bool, str]:
@@ -136,15 +227,17 @@ def _init_backend():
     # Initialize OAuth2 authentication
     init_oauth2()
 
-    _backend = os.getenv("M3_BACKEND", "duckdb")
+    _backend = os.getenv("M3_BACKEND", "sqlite")
 
-    if _backend == "duckdb":
+    if _backend == "sqlite":
         _db_path = os.getenv("M3_DB_PATH")
         if not _db_path:
-            path = get_default_database_path("mimic-iv-demo")
-            _db_path = str(path) if path else None
-        if not _db_path or not Path(_db_path).exists():
-            raise FileNotFoundError(f"DuckDB database not found: {_db_path}")
+            # Use default database path
+            _db_path = get_default_database_path("mimic-iv-demo")
+
+        # Ensure the database exists
+        if not Path(_db_path).exists():
+            raise FileNotFoundError(f"SQLite database not found: {_db_path}")
 
     elif _backend == "bigquery":
         try:
@@ -172,8 +265,8 @@ _init_backend()
 
 def _get_backend_info() -> str:
     """Get current backend information for display in responses."""
-    if _backend == "duckdb":
-        return f"🔧 **Current Backend:** DuckDB (local database)\n📁 **Database Path:** {_db_path}\n"
+    if _backend == "sqlite":
+        return f"🔧 **Current Backend:** SQLite (local database)\n📁 **Database Path:** {_db_path}\n"
     else:
         return f"🔧 **Current Backend:** BigQuery (cloud database)\n☁️ **Project ID:** {_project_id}\n"
 
@@ -186,22 +279,24 @@ def _get_backend_info() -> str:
 # from calling other MCP tools, which violates the MCP protocol.
 
 
-def _execute_duckdb_query(sql_query: str) -> str:
-    """Execute DuckDB query - internal function."""
+def _execute_sqlite_query(sql_query: str) -> str:
+    """Execute SQLite query - internal function."""
     try:
-        conn = duckdb.connect(_db_path)
+        conn = sqlite3.connect(_db_path)
         try:
-            df = conn.execute(sql_query).df()
+            df = pd.read_sql_query(sql_query, conn)
+
             if df.empty:
                 return "No results found"
+
+            # Limit output size
             if len(df) > 50:
-                out = (
-                    df.head(50).to_string(index=False)
-                    + f"\n... ({len(df)} total rows, showing first 50)"
-                )
+                result = df.head(50).to_string(index=False)
+                result += f"\n... ({len(df)} total rows, showing first 50)"
             else:
-                out = df.to_string(index=False)
-            return out
+                result = df.to_string(index=False)
+
+            return result
         finally:
             conn.close()
     except Exception as e:
@@ -254,8 +349,8 @@ def _execute_query_internal(sql_query: str) -> str:
         return f"❌ **Security Error:** {message}\n\n💡 **Tip:** Only SELECT statements are allowed for data analysis."
 
     try:
-        if _backend == "duckdb":
-            return _execute_duckdb_query(sql_query)
+        if _backend == "sqlite":
+            return _execute_sqlite_query(sql_query)
         else:  # bigquery
             return _execute_bigquery_query(sql_query)
     except Exception as e:
@@ -327,12 +422,185 @@ def _execute_query_internal(sql_query: str) -> str:
 
 📚 **Current Backend:** {_backend} - table names and syntax are backend-specific"""
 
+# ==========================================
+# INTERNAL HELPERS FOR GEMINI FTUBE TOOL
+# ==========================================
+
+def _normalize_ftube_label(text: str) -> str:
+    if not text:
+        return "Unclear"
+    tok = text.split()[0].rstrip(".,").title()
+    return tok if tok in {"Yes", "No", "Unclear"} else "Unclear"
+
+
+def _fetch_notes_for_gemini(
+    table_name: str,
+    id_column: str,
+    text_column: str,
+    where_clause: str = "",
+    limit: int = 50,
+) -> List[Tuple[Any, str]]:
+    """
+    NOTE:
+      - Claude never receives note_text directly.
+      - This function is only used inside m3, and its return value is passed
+        directly to the Gemini proxy.
+    """
+    if limit <= 0 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+
+    # Base SELECT query
+    sql = f"SELECT {id_column} AS note_id, {text_column} AS note_text FROM {table_name}"
+    if where_clause:
+        sql += f" WHERE {where_clause}"
+    sql += f" LIMIT {int(limit)}"
+
+    # Security validation (SELECT only)
+    is_safe, msg = _is_safe_query(sql)
+    if not is_safe:
+        raise ValueError(f"Unsafe query for Gemini helper: {msg}")
+
+    if _backend == "sqlite":
+        conn = sqlite3.connect(_db_path)
+        try:
+            df = pd.read_sql_query(sql, conn)
+        finally:
+            conn.close()
+    else:  # bigquery
+        from google.cloud import bigquery
+
+        job_config = bigquery.QueryJobConfig()
+        query_job = _bq_client.query(sql, job_config=job_config)
+        df = query_job.to_dataframe()
+
+    # Return (note_id, note_text) list
+    results: List[Tuple[Any, str]] = []
+    if not df.empty:
+        for _, row in df.iterrows():
+            results.append((row["note_id"], row["note_text"]))
+    return results
+
 
 # ==========================================
 # MCP TOOLS - PUBLIC API
 # ==========================================
 # These are the tools exposed via MCP protocol.
 # They should NEVER call other MCP tools - only internal functions.
+
+@mcp.tool()
+@require_oauth2
+def plan_feeding_tube_gemini(
+    user_text: str,
+    table_name: str = "note_discharge",
+    id_column: str = "note_id",
+    text_column: str = "text",
+    limit: int = 20,
+) -> Dict[str, Any]:
+    """
+    🔍 Before running the feeding-tube classification workflow, check whether the user's
+    description includes:
+    - context (definition/policy)
+    - few-shot examples
+    - WHERE clause (target note subset)
+
+    If any of these are missing, return questions to request clarification.
+    If all elements are present, return a plan containing arguments for
+    classify_feeding_tube_gemini_batch.
+    """
+    # 1) Extract context / few-shot pairs / WHERE candidates
+    context_suggest, where_suggest = _extract_ftube_context_and_where(user_text)
+    fewshot_pairs = _parse_ftube_fewshots(user_text)
+
+    has_context = bool(context_suggest)
+    has_fewshots = len(fewshot_pairs) > 0
+
+    questions: List[Dict[str, Any]] = []
+
+    # Missing context → ask user for policy definition
+    if not has_context:
+        questions.append(
+            {
+                "id": "context",
+                "type": "textarea",
+                "label": (
+                    "Please provide the classification policy/definition.\n"
+                    "Example: 'Mark Yes only if the patient actually had an active feeding tube "
+                    "(NG/PEG/J-tube/etc.) during the hospital stay. "
+                    "Mentions of possible tube placement, recommendations, or negations should be marked No.'"
+                ),
+            }
+        )
+
+    # Missing few-shot examples → ask optionally
+    if not has_fewshots:
+        questions.append(
+            {
+                "id": "fewshots",
+                "type": "textarea",
+                "optional": True,
+                "placeholder": (
+                    'Optional few-shot examples (if you want tighter control):\n'
+                    '- note: "example sentence 1"; label: "Yes"\n'
+                    '- note: "example sentence 2"; label: "No"'
+                ),
+            }
+        )
+
+    # Missing WHERE clause → ask optionally
+    if not where_suggest:
+        questions.append(
+            {
+                "id": "where_clause",
+                "type": "text",
+                "optional": True,
+                "placeholder": (
+                    "Specify the WHERE clause if you want to limit which notes to classify. Example: "
+                    "\"dischtime >= '2110-01-01'\". Leave empty to use all notes."
+                ),
+            }
+        )
+
+    # If missing information, return questions
+    if questions:
+        return {
+            "needs_more_info": True,
+            "questions": questions,
+            "detected": {
+                "has_context": has_context,
+                "has_fewshots": has_fewshots,
+                "context_suggest": context_suggest,
+                "fewshot_pairs": fewshot_pairs,
+                "where_suggest": where_suggest,
+            },
+        }
+
+    # 2) All required information is present → return plan for batch classification
+    plan = {
+        "tool": "classify_feeding_tube_gemini_batch",
+        "args": {
+            "table_name": table_name,
+            "id_column": id_column,
+            "text_column": text_column,
+            "where_clause": where_suggest,
+            "limit": limit,
+            "context": context_suggest,
+            # few-shot pairs are preserved for potential future use
+            "fewshot_pairs": fewshot_pairs,
+        },
+    }
+
+    return {
+        "needs_more_info": False,
+        "questions": [],
+        "detected": {
+            "has_context": has_context,
+            "has_fewshots": has_fewshots,
+            "context_suggest": context_suggest,
+            "fewshot_pairs": fewshot_pairs,
+            "where_suggest": where_suggest,
+        },
+        "plan": plan,
+    }
 
 
 @mcp.tool()
@@ -351,17 +619,11 @@ def get_database_schema() -> str:
     Returns:
         List of all available tables in the database with current backend info
     """
-    if _backend == "duckdb":
-        query = """
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = 'main'
-        ORDER BY table_name
-        """
+    if _backend == "sqlite":
+        query = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         result = _execute_query_internal(query)
         return f"{_get_backend_info()}\n📋 **Available Tables:**\n{result}"
-
-    elif _backend == "bigquery":
+    else:  # bigquery
         # Show fully qualified table names that are ready to copy-paste into queries
         query = """
         SELECT CONCAT('`physionet-data.mimiciv_3_1_hosp.', table_name, '`') as query_ready_table_name
@@ -398,19 +660,19 @@ def get_table_info(table_name: str, show_sample: bool = True) -> str:
     """
     backend_info = _get_backend_info()
 
-    if _backend == "duckdb":
+    if _backend == "sqlite":
         # Get column information
-        pragma_query = f"PRAGMA table_info('{table_name}')"
+        pragma_query = f"PRAGMA table_info({table_name})"
         try:
-            result = _execute_duckdb_query(pragma_query)
+            result = _execute_sqlite_query(pragma_query)
             if "error" in result.lower():
                 return f"{backend_info}❌ Table '{table_name}' not found. Use get_database_schema() to see available tables."
 
             info_result = f"{backend_info}📋 **Table:** {table_name}\n\n**Column Information:**\n{result}"
 
             if show_sample:
-                sample_query = f"SELECT * FROM '{table_name}' LIMIT 3"
-                sample_result = _execute_duckdb_query(sample_query)
+                sample_query = f"SELECT * FROM {table_name} LIMIT 3"
+                sample_result = _execute_sqlite_query(sample_query)
                 info_result += (
                     f"\n\n📊 **Sample Data (first 3 rows):**\n{sample_result}"
                 )
@@ -431,7 +693,7 @@ def get_table_info(table_name: str, show_sample: bool = True) -> str:
             # Validate BigQuery qualified name format: project.dataset.table
             if len(parts) != 3:
                 error_msg = (
-                    f"{backend_info}❌ **Invalid qualified table name:** `{table_name}`\n\n"
+                    f"{_get_backend_info()}❌ **Invalid qualified table name:** `{table_name}`\n\n"
                     "**Expected format:** `project.dataset.table`\n"
                     "**Example:** `physionet-data.mimiciv_3_1_hosp.diagnoses_icd`\n\n"
                     "**Available MIMIC-IV datasets:**\n"
@@ -529,6 +791,19 @@ def execute_mimic_query(sql_query: str) -> str:
     Returns:
         Query results or helpful error messages with next steps
     """
+    # 🔒 Extra protection: prevent local note text exposure
+    if os.getenv("M3_BLOCK_NOTE_TEXT", "1") == "1" and _contains_raw_note_text(sql_query):
+        return (
+            "❌ **Security Policy:** Raw note text columns are blocked in this environment.\n\n"
+            "In this MCP environment, raw discharge notes and similar free-text fields cannot be directly exposed to the assistant.\n"
+            "- Columns like `text`, `note_text`, or expressions such as `LOWER(text)` and `SUBSTR(text, ...)` cannot be queried via `execute_mimic_query`.\n"
+            "- Instead, please use a workflow such as:\n"
+            "  1. Run `classify_feeding_tube_gemini_batch` to classify note_ids using Gemini.\n"
+            "  2. Bring back only labels/counts/ID lists (Yes/No/Unclear) into this environment.\n"
+            "  3. If needed, inspect the raw text only in a secure local environment (Python, SQL) without sending it to the model.\n\n"
+            "💡 If you really need to query text safely, you can create a 'safe view' (without PHI) and query that instead."
+        )
+
     return _execute_query_internal(sql_query)
 
 
@@ -554,7 +829,7 @@ def get_icu_stays(patient_id: int | None = None, limit: int = 10) -> str:
         return "Error: Invalid limit. Must be a positive integer between 1 and 10000."
 
     # Try common ICU table names based on backend
-    if _backend == "duckdb":
+    if _backend == "sqlite":
         icustays_table = "icu_icustays"
     else:  # bigquery
         icustays_table = "`physionet-data.mimiciv_3_1_icu.icustays`"
@@ -604,7 +879,7 @@ def get_lab_results(
         return "Error: Invalid limit. Must be a positive integer between 1 and 10000."
 
     # Try common lab table names based on backend
-    if _backend == "duckdb":
+    if _backend == "sqlite":
         labevents_table = "hosp_labevents"
     else:  # bigquery
         labevents_table = "`physionet-data.mimiciv_3_1_hosp.labevents`"
@@ -659,7 +934,7 @@ def get_race_distribution(limit: int = 10) -> str:
         return "Error: Invalid limit. Must be a positive integer between 1 and 10000."
 
     # Try common admissions table names based on backend
-    if _backend == "duckdb":
+    if _backend == "sqlite":
         admissions_table = "hosp_admissions"
     else:  # bigquery
         admissions_table = "`physionet-data.mimiciv_3_1_hosp.admissions`"
@@ -680,32 +955,206 @@ This ensures compatibility across different MIMIC-IV setups."""
 
     return result
 
+# ==========================================
+# GEMINI FEEDING-TUBE CLASSIFIER TOOL
+# ==========================================
+
+def _normalize_ftube_label(text: str) -> str:
+    if not text:
+        return "Unclear"
+    tok = text.split()[0].rstrip(".,").title()
+    return tok if tok in {"Yes", "No", "Unclear"} else "Unclear"
+
+
+def _call_gemini_proxy_ftube(
+    snippet: str,
+    context: str = "",
+    fewshots: List[Tuple[str, str]] | None = None,
+    temperature: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Call the FastAPI server running on a Vertex AI JupyterLab VM
+    (e.g., http://<VM_IP>:8081/ftube/classify) to receive
+    feeding tube classification (Yes/No/Unclear).
+    """
+    url = os.getenv("GEMINI_PROXY_URL")
+    if not url:
+        raise RuntimeError(
+            "Environment variable GEMINI_PROXY_URL is not set. "
+            "Example: GEMINI_PROXY_URL='http://35.224.111.104:8081/ftube/classify'"
+        )
+
+    fs_payload = [{"note": n, "label": l} for (n, l) in (fewshots or [])] if fewshots else None
+
+    payload: Dict[str, Any] = {
+        "snippet": snippet,
+        "context": context or "",
+        "fewshots": fs_payload,
+        "temperature": float(temperature),
+    }
+
+    t0 = time.time()
+    resp = requests.post(url, json=payload, timeout=60)
+    latency = time.time() - t0
+    resp.raise_for_status()
+
+    data = resp.json()
+    prediction = data.get("prediction")
+    raw_output = data.get("raw_output", "")
+    latency_sec = data.get("latency_sec", latency)
+
+    if not prediction:
+        prediction = _normalize_ftube_label(raw_output)
+
+    return {
+        "prediction": prediction,
+        "raw_output": raw_output,
+        "latency_sec": float(latency_sec),
+    }
+
+
+@mcp.tool()
+@require_oauth2
+def classify_feeding_tube_gemini_by_id(
+    note_id: int,
+    table_name: str,
+    id_column: str = "note_id",
+    text_column: str = "note_text",
+    context: str = "",
+    temperature: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    NOTE:
+      - The assistant only sees note_id and the label.
+      - The note text flows only from DB → Gemini proxy inside the m3 server.
+        It is never exposed directly to the assistant.
+
+    Args:
+        note_id: ID of the note to classify (integer)
+        table_name: Name of the note table (e.g., 'note_discharge')
+        id_column: Name of the note_id column (default: 'note_id')
+        text_column: Name of the text column (default: 'note_text')
+        context: Classification policy/definition text (optional)
+        temperature: Gemini temperature (default 0.0)
+
+    Returns:
+        {
+          "note_id": <int>,
+          "prediction": "Yes" | "No" | "Unclear",
+          "latency_sec": <float>,
+          "backend": "gemini_proxy"
+        }
+    """
+    where_clause = f"{id_column} = {int(note_id)}"
+    rows = _fetch_notes_for_gemini(
+        table_name=table_name,
+        id_column=id_column,
+        text_column=text_column,
+        where_clause=where_clause,
+        limit=1,
+    )
+    if not rows:
+        return {
+            "note_id": note_id,
+            "prediction": "Unclear",
+            "latency_sec": 0.0,
+            "backend": "gemini_proxy",
+            "message": "No note found for the given ID",
+        }
+
+    _, note_text = rows[0]
+    result = _call_gemini_proxy_ftube(
+        snippet=note_text,
+        context=context,
+        fewshots=None,
+        temperature=temperature,
+    )
+    return {
+        "note_id": note_id,
+        "prediction": result["prediction"],
+        "latency_sec": result["latency_sec"],
+        "backend": "gemini_proxy",
+    }
+
+@mcp.tool()
+@require_oauth2
+def classify_feeding_tube_gemini_batch(
+    table_name: str,
+    id_column: str = "note_id",
+    text_column: str = "note_text",
+    where_clause: str = "",
+    limit: int = 20,
+    context: str = "",
+    temperature: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Classify multiple notes in a batch (note text is never exposed to the assistant).
+
+    Args:
+        table_name: Note table name (e.g., 'note_discharge')
+        id_column: ID column name (default 'note_id')
+        text_column: Text column name (default 'note_text')
+        where_clause: SQL WHERE clause (e.g., "dischtime >= '2110-01-01'")
+        limit: Maximum number of notes (default 20)
+        context: Classification policy/definition text
+        temperature: Gemini temperature (default 0.0)
+
+    Returns:
+        {
+          "backend": "gemini_proxy",
+          "n_notes": <int>,
+          "counts": {"Yes": int, "No": int, "Unclear": int},
+          "predictions": [
+            {"note_id": ..., "prediction": "Yes" | "No" | "Unclear"},
+            ...
+          ]
+        }
+    """
+    rows = _fetch_notes_for_gemini(
+        table_name=table_name,
+        id_column=id_column,
+        text_column=text_column,
+        where_clause=where_clause,
+        limit=limit,
+    )
+    if not rows:
+        return {
+            "backend": "gemini_proxy",
+            "n_notes": 0,
+            "counts": {"Yes": 0, "No": 0, "Unclear": 0},
+            "predictions": [],
+            "message": "No notes matched the given condition",
+        }
+
+    predictions: List[Dict[str, Any]] = []
+    counts = {"Yes": 0, "No": 0, "Unclear": 0}
+
+    for nid, note_text in rows:
+        result = _call_gemini_proxy_ftube(
+            snippet=note_text,
+            context=context,
+            fewshots=None,
+            temperature=temperature,
+        )
+        label = result["prediction"]
+        if label not in counts:
+            label = "Unclear"
+        counts[label] += 1
+        predictions.append({"note_id": nid, "prediction": label})
+
+    return {
+        "backend": "gemini_proxy",
+        "n_notes": len(predictions),
+        "counts": counts,
+        "predictions": predictions,
+    }
+
 
 def main():
-    """Main entry point for MCP server.
+    """Main entry point for MCP server."""
+    # Run the FastMCP server
+    mcp.run()
 
-    Runs FastMCP server in either STDIO mode (desktop clients) or HTTP mode
-    (Kubernetes/web clients). Transport mode configured via environment variables.
-
-    Environment Variables:
-        MCP_TRANSPORT: "stdio" (default), "sse", or "http"
-        MCP_HOST: Host binding for HTTP mode (default: "0.0.0.0")
-        MCP_PORT: Port for HTTP mode (default: 3000)
-        MCP_PATH: SSE endpoint path for HTTP mode (default: "/sse")
-
-    Notes:
-        HTTP/SSE mode uses streamable-http transport for containerized deployments
-        where STDIO is unavailable. Binds to 0.0.0.0 for Kubernetes service mesh access.
-    """
-    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
-
-    if transport in ("sse", "http"):
-        host = os.getenv("MCP_HOST", "0.0.0.0")
-        port = int(os.getenv("MCP_PORT", "3000"))
-        path = os.getenv("MCP_PATH", "/sse")
-        mcp.run(transport="streamable-http", host=host, port=port, path=path)
-    else:
-        mcp.run()
 
 
 if __name__ == "__main__":
